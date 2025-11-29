@@ -29,6 +29,14 @@ coverage.xml
 .pytest_cache
 .hypothesis
 
+# Data and Artifacts (DO NOT PUSH THESE)
+data/
+outputs/
+mlruns/
+mlflow.db
+*.pth
+best_model.pth
+
 # Virtual environments
 .env
 .venv
@@ -37,7 +45,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
+.venv/
 # IDE
 .vscode/
 .idea/

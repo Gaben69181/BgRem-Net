@@ -1,14 +1,10 @@
 """backend/train.py
 
 Training script for U-Net foreground/background segmentation.
-
-This module can be run as a script:
-
-    python backend/train.py --data-root data --epochs 20
-
-It trains a U-Net model on a paired image/mask dataset and reports
-IoU, Dice, and pixel accuracy. Optionally, it can export per-epoch
-prediction frames for later timelapse visualization.
+Features:
+- MLflow Experiment Tracking (SQLite backend)
+- TQDM Progress Bars
+- Automatic Mixed Precision (AMP) for faster training
 """
 
 from __future__ import annotations
@@ -22,10 +18,20 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
+from tqdm import tqdm  # Progress bar
+from torch.cuda.amp import GradScaler, autocast # Mixed Precision
 
-from .model import build_unet
-from .dataset import create_dataloaders
-from .metrics import BCEDiceLoss, evaluate_batch
+import mlflow
+
+# Handle imports whether run as script or module
+if __name__ == "__main__" and __package__ is None:
+    from model import build_unet
+    from dataset import create_dataloaders
+    from metrics import BCEDiceLoss, evaluate_batch
+else:
+    from .model import build_unet
+    from .dataset import create_dataloaders
+    from .metrics import BCEDiceLoss, evaluate_batch
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,12 +78,6 @@ def save_checkpoint(
 
 
 def load_pretrained_if_available(model: nn.Module, checkpoint_path: str, device: torch.device) -> None:
-    """
-    Load weights from an existing checkpoint for fine-tuning.
-
-    This allows using pretrained weights while still performing
-    further training on the target dataset.
-    """
     if checkpoint_path and os.path.isfile(checkpoint_path):
         print(f"Loading pretrained checkpoint from {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device)
@@ -88,7 +88,6 @@ def load_pretrained_if_available(model: nn.Module, checkpoint_path: str, device:
 
 
 def infer_batch(model: nn.Module, images: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Run a forward pass and return logits on CPU."""
     model.eval()
     with torch.no_grad():
         images = images.to(device, non_blocking=True)
@@ -100,12 +99,6 @@ def maybe_init_timelapse_samples(
     val_loader: DataLoader,
     num_samples: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Grab a fixed mini-batch from the validation loader for timelapse visualization.
-
-    Returns:
-        (images, masks) on CPU with shape (N, C, H, W) and (N, 1, H, W).
-    """
     if num_samples <= 0:
         raise ValueError("num_samples must be > 0 for timelapse.")
 
@@ -123,19 +116,11 @@ def save_timelapse_frames(
     pred_masks: torch.Tensor,
     out_dir: str,
 ) -> None:
-    """
-    Save side-by-side image/ground-truth/predicted mask triplets for timelapse.
-
-    Frames are stored as:
-        {out_dir}/sample_{i}/epoch_{epoch:03d}.png
-    """
     os.makedirs(out_dir, exist_ok=True)
-
     images_np = images.clone()
     gt_np = gt_masks.clone()
     pred_np = pred_masks.clone()
 
-    # Ensure in [0,1]
     images_np = torch.clamp(images_np, 0.0, 1.0)
     gt_np = torch.clamp(gt_np, 0.0, 1.0)
     pred_np = torch.clamp(pred_np, 0.0, 1.0)
@@ -145,11 +130,8 @@ def save_timelapse_frames(
         sample_dir = os.path.join(out_dir, f"sample_{i:02d}")
         os.makedirs(sample_dir, exist_ok=True)
 
-        # Convert single-channel masks to 3-channel for visualization
         gt_3ch = gt_np[i].repeat(3, 1, 1)
         pred_3ch = pred_np[i].repeat(3, 1, 1)
-
-        # Concatenate horizontally: [image | gt | pred]
         triplet = torch.cat([images_np[i], gt_3ch, pred_3ch], dim=2)
 
         frame_path = os.path.join(sample_dir, f"epoch_{epoch:03d}.png")
@@ -166,17 +148,32 @@ def train_one_epoch(
     model.train()
     running_loss = 0.0
 
-    for images, masks in loader:
+    # Initialize Scaler for Mixed Precision
+    scaler = GradScaler()
+    
+    # TQDM Progress Bar for Training
+    pbar = tqdm(loader, desc="Training", leave=False)
+
+    for images, masks in pbar:
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(images)
-        loss = criterion(logits, masks)
-        loss.backward()
-        optimizer.step()
+        
+        # Cast operations to mixed precision
+        with autocast():
+            logits = model(images)
+            loss = criterion(logits, masks)
+        
+        # Scale loss and backward
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         running_loss += loss.item() * images.size(0)
+        
+        # Update progress bar
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     return running_loss / len(loader.dataset)
 
@@ -193,7 +190,10 @@ def validate_one_epoch(
     metric_sums = {"iou": 0.0, "dice": 0.0, "pixel_acc": 0.0}
     total_samples = 0
 
-    for images, masks in loader:
+    # TQDM Progress Bar for Validation
+    pbar = tqdm(loader, desc="Validating", leave=False)
+
+    for images, masks in pbar:
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
@@ -218,71 +218,92 @@ def main() -> None:
     device = prepare_device(args.device)
 
     print(f"Using device: {device}")
-    print(f"Data root  : {args.data_root}")
+    
+    # --- MLFLOW SETUP ---
+    # Fix for Future Warning: Use local SQLite database instead of file system
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    mlflow.set_experiment("UNet-Background-Removal")
+    
+    with mlflow.start_run():
+        mlflow.log_params(vars(args))
 
-    train_loader, val_loader = create_dataloaders(
-        data_root=args.data_root,
-        img_size=args.img_size,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
-
-    model = build_unet(n_channels=3, n_classes=1)
-    model.to(device)
-
-    load_pretrained_if_available(model, args.pretrained_checkpoint, device=device)
-
-    criterion = BCEDiceLoss()
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    best_val_iou = 0.0
-    fixed_images: torch.Tensor | None = None
-    fixed_masks: torch.Tensor | None = None
-
-    if args.timelapse:
-        fixed_images, fixed_masks = maybe_init_timelapse_samples(val_loader, args.timelapse_samples)
-
-    for epoch in range(1, args.epochs + 1):
-        start_time = time.time()
-
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_metrics = validate_one_epoch(model, val_loader, criterion, device)
-
-        elapsed = time.time() - start_time
-        msg = (
-            f"Epoch {epoch:03d}/{args.epochs:03d} "
-            f"- train_loss: {train_loss:.4f} "
-            f"- val_loss: {val_loss:.4f} "
-            f"- IoU: {val_metrics['iou']:.4f} "
-            f"- Dice: {val_metrics['dice']:.4f} "
-            f"- PixelAcc: {val_metrics['pixel_acc']:.4f} "
-            f"- time: {elapsed:.1f}s"
+        train_loader, val_loader = create_dataloaders(
+            data_root=args.data_root,
+            img_size=args.img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
         )
-        print(msg)
 
-        # Save best checkpoint based on IoU
-        if val_metrics["iou"] > best_val_iou:
-            best_val_iou = val_metrics["iou"]
-            ckpt_path = os.path.join(args.checkpoint_dir, "best_model.pth")
-            save_checkpoint(model, optimizer, epoch, best_val_iou, ckpt_path)
-            print(f"  - New best IoU: {best_val_iou:.4f} (checkpoint saved to {ckpt_path})")
+        model = build_unet(n_channels=3, n_classes=1)
+        model.to(device)
 
-        # Optionally export timelapse frames
-        if args.timelapse and fixed_images is not None and fixed_masks is not None:
-            logits = infer_batch(model, fixed_images, device)
-            probs = torch.sigmoid(logits)
-            pred_masks = (probs >= 0.5).float()
-            save_timelapse_frames(
-                epoch=epoch,
-                images=fixed_images,
-                gt_masks=fixed_masks,
-                pred_masks=pred_masks,
-                out_dir=args.timelapse_dir,
+        load_pretrained_if_available(model, args.pretrained_checkpoint, device=device)
+
+        criterion = BCEDiceLoss()
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+        best_val_iou = 0.0
+        fixed_images: torch.Tensor | None = None
+        fixed_masks: torch.Tensor | None = None
+
+        if args.timelapse:
+            fixed_images, fixed_masks = maybe_init_timelapse_samples(val_loader, args.timelapse_samples)
+
+        print(f"Starting training for {args.epochs} epochs...")
+        for epoch in range(1, args.epochs + 1):
+            start_time = time.time()
+
+            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, val_metrics = validate_one_epoch(model, val_loader, criterion, device)
+
+            elapsed = time.time() - start_time
+            msg = (
+                f"Epoch {epoch:03d}/{args.epochs:03d} "
+                f"| Train Loss: {train_loss:.4f} "
+                f"| Val IoU: {val_metrics['iou']:.4f} "
+                f"| Time: {elapsed:.1f}s"
             )
+            print(msg)
+
+            # MLflow Logging
+            metrics_to_log = {
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_iou": val_metrics["iou"],
+                "val_dice": val_metrics["dice"],
+                "val_pixel_acc": val_metrics["pixel_acc"],
+            }
+            mlflow.log_metrics(metrics_to_log, step=epoch)
+
+            # Save best model
+            if val_metrics["iou"] > best_val_iou:
+                best_val_iou = val_metrics["iou"]
+                ckpt_path = os.path.join(args.checkpoint_dir, "best_model.pth")
+                save_checkpoint(model, optimizer, epoch, best_val_iou, ckpt_path)
+                print(f"  >>> New Best IoU! Saved: {ckpt_path}")
+                mlflow.log_artifact(ckpt_path, artifact_path="checkpoints")
+
+            # Timelapse
+            if args.timelapse and fixed_images is not None and fixed_masks is not None:
+                logits = infer_batch(model, fixed_images, device)
+                probs = torch.sigmoid(logits)
+                pred_masks = (probs >= 0.5).float()
+                save_timelapse_frames(
+                    epoch=epoch,
+                    images=fixed_images,
+                    gt_masks=fixed_masks,
+                    pred_masks=pred_masks,
+                    out_dir=args.timelapse_dir,
+                )
+        
+        # Log timelapse outputs if they exist
+        if args.timelapse and os.path.exists(args.timelapse_dir):
+            print("Uploading timelapse frames to MLflow...")
+            mlflow.log_artifacts(args.timelapse_dir, artifact_path="timelapse_frames")
 
     print("Training complete.")
 

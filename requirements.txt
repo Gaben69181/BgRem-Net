@@ -8,3 +8,4 @@ imageio==2.31.0
 opencv-python==4.8.0
 tqdm==4.66.0
 kagglehub==0.3.0
+mlflow
