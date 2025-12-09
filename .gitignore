@@ -1,5 +1,8 @@
 # Outputs and checkpoints
-outputs/
+outputs/*
+!outputs/plots/
+!outputs/timelapse/
+!outputs/videos/
 backend/outputs/
 
 # Plots and timelapse
