@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import os
+import base64
 import sys
 from typing import Optional, Tuple
 
@@ -18,6 +19,10 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(THIS_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+# Default paths resolved relative to the project root
+DEFAULT_CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "outputs", "checkpoints", "best_model.pth")
+DEFAULT_TIMELAPSE_ROOT = os.path.join(PROJECT_ROOT, "outputs", "videos")
 
 from backend.inference import (  # type: ignore  # noqa: E402
     InferenceConfig,
@@ -62,7 +67,7 @@ def main() -> None:
 
         checkpoint_path = st.text_input(
             "Model checkpoint path",
-            value="../backend/outputs/checkpoints/best_model.pth",
+            value=DEFAULT_CHECKPOINT_PATH,
             help="Path to the trained U-Net checkpoint (.pth).",
         )
 
@@ -107,7 +112,7 @@ def main() -> None:
             "`python backend/timelapse.py` and will appear under `outputs/videos`."
         )
 
-        timelapse_root = "outputs/videos"
+        timelapse_root = DEFAULT_TIMELAPSE_ROOT
         timelapse_files = []
         if os.path.isdir(timelapse_root):
             for f in os.listdir(timelapse_root):
@@ -178,15 +183,15 @@ def main() -> None:
         # Ensure masks are in displayable size (already upscaled to original in predict_mask)
         with col1:
             st.subheader("Original image")
-            st.image(image, use_column_width=True)
+            st.image(image, use_container_width=True)
 
         with col2:
             st.subheader("Segmentation mask")
-            st.image(soft_mask, use_column_width=True, clamp=True)
+            st.image(soft_mask, use_container_width=True, clamp=True)
 
         with col3:
             st.subheader("Background removed")
-            st.image(composed, use_column_width=True)
+            st.image(composed, use_container_width=True)
 
         st.markdown("---")
         st.subheader("Download results")
@@ -226,7 +231,13 @@ def main() -> None:
     if selected_timelapse is not None:
         st.write(f"Showing timelapse: `{os.path.basename(selected_timelapse)}`")
         if selected_timelapse.lower().endswith(".gif"):
-            st.image(selected_timelapse)
+            with open(selected_timelapse, "rb") as file_:
+                contents = file_.read()
+            data_url = base64.b64encode(contents).decode("utf-8")
+            st.markdown(
+                f'<img src="data:image/gif;base64,{data_url}" alt="timelapse gif" style="max-width: 100%;">',
+                unsafe_allow_html=True,
+            )
         else:
             st.video(selected_timelapse)
     else:

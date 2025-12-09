@@ -2,8 +2,13 @@
 outputs/
 backend/outputs/
 
+# Plots and timelapse
+plots/
+timelapse/
+
 # Data (large files)
-backend/data/
+data/
+data_p3m/
 
 # Python
 __pycache__/

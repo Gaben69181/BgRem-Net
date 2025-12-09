@@ -19,32 +19,34 @@ backend for training, evaluation, inference, and visualization.
 ```text
 project_root/
 ├── backend/
-│   ├── model.py          # U-Net model definition
-│   ├── dataset.py        # Dataset + dataloaders for paired images / masks
-│   ├── train.py          # Training & validation loop (+ timelapse frame export)
-│   ├── inference.py      # Inference utilities & CLI
-│   ├── timelapse.py      # Build GIF/MP4 timelapse videos from frames
-│   ├── metrics.py        # Losses (BCE+Dice) and metrics (IoU, Dice, Pixel Acc.)
+│   ├── dataset.py          # Dataset + dataloaders for paired images / masks
+│   ├── model.py            # U-Net / U²-Net model definitions
+│   ├── metrics.py          # Losses (BCE+Dice+edge) and metrics (IoU, Dice, Pixel Acc.)
+│   ├── train.py            # Training & validation loop (+ optional timelapse frames)
+│   ├── inference.py        # Inference utilities & CLI
+│   ├── timelapse.py        # Build GIF/MP4 timelapse videos from saved frames
+│   ├── visualize_val.py    # Visualize validation predictions from a checkpoint
+│   └── download_dataset.py # Download & organize the P3M-10k dataset from Kaggle
 │
 ├── frontend/
-│   └── app.py            # Streamlit web UI for interactive background removal
+│   └── app.py              # Streamlit web UI for interactive background removal
 │
-├── data/
+├── data_p3m/               # (Optional) P3M-10k dataset root created by download_dataset.py
 │   ├── train/
-│   │   ├── images/       # Training RGB images
-│   │   └── masks/        # Corresponding binary/alpha masks
+│   │   ├── images/         # Training RGB images
+│   │   └── masks/          # Corresponding alpha/binary masks
 │   └── val/
-│       ├── images/       # Validation RGB images
-│       └── masks/        # Corresponding binary/alpha masks
+│       ├── images/         # Validation RGB images
+│       └── masks/          # Corresponding alpha/binary masks
 │
-├── outputs/
-│   ├── checkpoints/      # Saved model checkpoints (best_model.pth)
-│   ├── images/           # Inference outputs (masks + composited foregrounds)
-│   ├── timelapse/        # Per-epoch prediction frames 
-│   └── videos/           # GIF/MP4 timelapse videos
+├── outputs/                # Training & inference artifacts (created at runtime)
+│   ├── checkpoints/        # Saved model checkpoints (best_model.pth)
+│   ├── images/             # Inference outputs (masks + composited foregrounds)
+│   ├── timelapse/          # Per-epoch prediction frames
+│   └── videos/             # GIF/MP4 timelapse videos
 │
-├── requirements.txt      # Python dependencies
-└── README.md             # This documentation
+├── requirements.txt        # Python dependencies
+└── README.md               # This documentation
 ```
 
 ## 2. Installation
@@ -71,21 +73,21 @@ project_root/
    print(torch.cuda.is_available())
    ```
 
-4. Download and prepare the dataset:
+4. Download and prepare the dataset (P3M-10k from Kaggle):
 
    ```bash
-   python download_dataset.py
+   python backend/download_dataset.py --data-root data_p3m
    ```
 
-   This downloads the AISegment.com Matting Human Datasets from Kaggle and
-   organizes them into the required `data/` folder structure.
+   This downloads the **P3M-10k** portrait matting dataset via `kagglehub` and
+   organizes it into the required `data_p3m/train/` and `data_p3m/val/` folder structure.
 
 ## 3. Dataset
 
 The code assumes a **paired image–mask dataset** with the following structure:
 
 ```text
-data/
+data_p3m/
 ├── train/
 │   ├── images/
 │   └── masks/
@@ -101,22 +103,22 @@ data/
   white (255) and background pixels are black (0). Grayscale alpha mattes are
   automatically thresholded at 0.5.
 
-### 3.1 Automatic dataset download
+### 3.1 Automatic dataset download (P3M-10k)
 
-To use the AISegment.com Matting Human Datasets from Kaggle, run:
+To use the **P3M-10k** portrait matting dataset from Kaggle, run from the project root:
 
 ```bash
-python download_dataset.py
+python backend/download_dataset.py --data-root data_p3m
 ```
 
 This will:
-- Download the dataset using `kagglehub`
-- Organize the files into `data/train/` and `data/val/` subfolders
 
-**Note:** The script includes placeholder paths for organizing the dataset.
-After downloading, inspect the downloaded folder structure and adjust the
-`organize_dataset()` function in `download_dataset.py` if needed to match
-the actual dataset layout.
+- Download the dataset using `kagglehub`
+- Organize the files into `data_p3m/train/` and `data_p3m/val/` subfolders,
+  each with `images/` and `masks/` inside.
+
+You can control the number of samples copied with `--max-train` and `--max-val`
+(see `backend/download_dataset.py` for details).
 
 ### 3.2 Manual dataset setup
 
@@ -151,7 +153,7 @@ the project root:
 
 ```bash
 python backend/train.py \
-  --data-root data \
+  --data-root data_p3m \
   --epochs 20 \
   --batch-size 4 \
   --img-size 512 \
@@ -162,14 +164,14 @@ python backend/train.py \
 Important arguments:
 
 - `--data-root` : Root folder containing `train/` and `val/` subfolders.
-- `--epochs`    : Number of training epochs.
+- `--epochs` : Number of training epochs.
 - `--batch-size`: Batch size (fits into GPU memory; adjust as needed).
-- `--img-size`  : Internal square resize; 512 is a good default.
-- `--lr`        : Learning rate for Adam optimizer.
+- `--img-size` : Internal square resize; 512 is a good default.
+- `--lr` : Learning rate for Adam optimizer.
 - `--timelapse` : If set, saves per-epoch prediction frames for a few
-                  validation samples into `outputs/timelapse/`.
+  validation samples into `outputs/timelapse/`.
 - `--pretrained-checkpoint` : Optional `.pth` file for fine-tuning instead of
-                              training from scratch.
+  training from scratch.
 
 Checkpoints are saved to `outputs/checkpoints/best_model.pth` based on the best
 validation IoU score.
@@ -183,7 +185,7 @@ We use a combination of:
 
 combined as:
 
-\( L = \lambda_{BCE} \cdot L_{BCE} + \lambda_{Dice} \cdot L_{Dice} \)
+\( L = \lambda*{BCE} \cdot L*{BCE} + \lambda*{Dice} \cdot L*{Dice} \)
 
 This captures both pixel-wise accuracy (BCE) and overlap quality (Dice).
 
@@ -234,8 +236,8 @@ python backend/inference.py path/to/image.jpg \
 Outputs:
 
 - `*_mask_binary.png` – binary foreground mask (0/255).
-- `*_mask_soft.png`   – soft grayscale probability mask (0–255).
-- `*_foreground.png`  – composited RGBA image with transparent background.
+- `*_mask_soft.png` – soft grayscale probability mask (0–255).
+- `*_foreground.png` – composited RGBA image with transparent background.
 
 You can also optionally specify a solid background color (e.g. green screen):
 
@@ -283,19 +285,19 @@ High-level sequence:
    pip install -r requirements.txt
    ```
 
-2. **Download and prepare dataset:**
+2. **Download and prepare dataset (P3M-10k from Kaggle):**
 
    ```bash
-   python download_dataset.py
+   python backend/download_dataset.py --data-root data_p3m
    ```
 
-   This automatically downloads the AISegment.com Matting Human Datasets and
-   organizes them into `data/train/` and `data/val/` folders.
+   This automatically downloads the **P3M-10k** dataset and
+   organizes it into `data_p3m/train/` and `data_p3m/val/` folders.
 
 3. **Train (with timelapse frames):**
 
    ```bash
-   python backend/train.py --data-root data --epochs 20 --timelapse
+   python backend/train.py --data-root data_p3m --epochs 20 --timelapse
    ```
 
 4. **Generate timelapse videos:**
@@ -317,3 +319,50 @@ High-level sequence:
    ```bash
    streamlit run frontend/app.py
    ```
+
+## 10. Notes for academic presentation
+
+When presenting this project, you can highlight:
+
+1. **Problem definition**
+
+   - Background removal as a pixel-wise binary segmentation problem.
+   - Importance in virtual backgrounds, photo editing, AR, etc.
+
+2. **Model choice (U-Net)**
+
+   - Encoder–decoder structure with skip connections.
+   - Trade-off between model capacity and real-time inference speed.
+
+3. **Data processing**
+
+   - Handling of arbitrary input resolutions via resize to 512×512.
+   - Data augmentation (flips, slight rotations) to improve generalization.
+
+4. **Loss and metrics**
+
+   - Why combine BCE + Dice (stability + overlap quality).
+   - Use of IoU, Dice, and pixel accuracy to evaluate segmentation.
+
+5. **Results & visualization**
+
+   - Qualitative examples of input / mask / background-removed outputs.
+   - Timelapse videos illustrating convergence over training epochs.
+
+6. **Limitations & future work**
+   - Failure cases (e.g., very complex backgrounds, small objects).
+   - Possible extensions: MODNet-style trimap, refinement network,
+     more advanced backbones (e.g., ResNet, MobileNet), or knowledge
+     distillation for faster inference.
+
+## 11. Reproducibility checklist
+
+- [x] Fixed project structure with separate frontend and backend.
+- [x] Deterministic input size (512×512) and normalization.
+- [x] Clearly defined training/evaluation scripts (`backend/train.py`).
+- [x] Defined metrics (IoU, Dice, Pixel Accuracy).
+- [x] Local deployment with Streamlit UI (`frontend/app.py`).
+- [x] Timelapse visualization pipeline (`backend/timelapse.py`).
+
+This completes a full deep learning pipeline for **image background removal**
+from dataset and training to evaluation, visualization, and local deployment.
