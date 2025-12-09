@@ -22,15 +22,21 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
+import matplotlib.pyplot as plt
 
-from .model import build_unet
-from .dataset import create_dataloaders
-from .metrics import BCEDiceLoss, evaluate_batch
+from model import build_unet, build_u2net, build_u2net_lite
+from dataset import create_dataloaders
+from metrics import BCEDiceLoss, EdgeAwareLoss, evaluate_batch
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train U-Net for background removal segmentation.")
-    parser.add_argument("--data-root", type=str, default="data", help="Root folder containing train/ and val/ subfolders.")
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default="data_p3m",
+        help="Root folder containing train/ and val/ subfolders (e.g. data_p3m).",
+    )
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=4, help="Mini-batch size.")
     parser.add_argument("--img-size", type=int, default=512, help="Input image size (square).")
@@ -156,6 +162,123 @@ def save_timelapse_frames(
         save_image(triplet, frame_path)
 
 
+def plot_training_curves(
+    history: Dict[str, list[float]],
+    out_dir: str = "outputs/plots",
+    filename: str = "training_curves.png",
+) -> None:
+    """
+    Plot training/validation loss and validation metrics over epochs.
+
+    Saves a PNG file containing:
+        - train_loss vs. val_loss
+        - val IoU, Dice, and Pixel Accuracy
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    epochs = range(1, len(history.get("train_loss", [])) + 1)
+
+    if not epochs:
+        print("No history to plot; skipping training curve plotting.")
+        return
+
+    plt.figure(figsize=(12, 8))
+
+    # Loss curves
+    plt.subplot(2, 1, 1)
+    plt.plot(epochs, history["train_loss"], label="Train Loss")
+    plt.plot(epochs, history["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss")
+    plt.legend()
+    plt.grid(True)
+
+    # Metric curves
+    plt.subplot(2, 1, 2)
+    plt.plot(epochs, history["val_iou"], label="Val IoU")
+    plt.plot(epochs, history["val_dice"], label="Val Dice")
+    plt.plot(epochs, history["val_pixel_acc"], label="Val PixelAcc")
+    plt.xlabel("Epoch")
+    plt.ylabel("Score")
+    plt.title("Validation Metrics")
+    plt.legend()
+    plt.grid(True)
+
+    out_path = os.path.join(out_dir, filename)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    print(f"Saved training curves to {out_path}")
+
+
+@torch.no_grad()
+def plot_sample_predictions(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    out_path: str,
+    num_samples: int = 4,
+) -> None:
+    """
+    Plot a few sample predictions from the validation set.
+
+    For each sample, show:
+        - input image
+        - ground-truth mask
+        - predicted soft mask (sigmoid output)
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    model.eval()
+
+    try:
+        images, masks = next(iter(loader))
+    except StopIteration:
+        print("Validation loader is empty; skipping sample prediction plotting.")
+        return
+
+    images = images.to(device, non_blocking=True)
+    masks = masks.to(device, non_blocking=True)
+
+    logits = model(images)
+    probs = torch.sigmoid(logits)
+
+    b = min(num_samples, images.size(0))
+    images = images[:b].cpu()
+    masks = masks[:b].cpu()
+    probs = probs[:b].cpu()
+
+    fig, axes = plt.subplots(b, 4, figsize=(12, 3 * b))
+    if b == 1:
+        axes = axes[None, :]  # ensure 2D indexing
+
+    for i in range(b):
+        img = images[i].permute(1, 2, 0).clamp(0.0, 1.0).numpy()
+        gt = masks[i, 0].numpy()
+        pred = probs[i, 0].numpy()
+        foreground = img * pred[..., None]
+
+        axes[i, 0].imshow(img)
+        axes[i, 0].set_title("Image")
+        axes[i, 0].axis("off")
+
+        axes[i, 1].imshow(gt, cmap="gray")
+        axes[i, 1].set_title("GT Mask")
+        axes[i, 1].axis("off")
+
+        axes[i, 2].imshow(pred, cmap="gray")
+        axes[i, 2].set_title("Pred Mask (soft)")
+        axes[i, 2].axis("off")
+
+        axes[i, 3].imshow(foreground)
+        axes[i, 3].set_title("Foreground")
+        axes[i, 3].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    print(f"Saved sample predictions to {out_path}")
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -227,17 +350,28 @@ def main() -> None:
         num_workers=args.num_workers,
     )
 
-    model = build_unet(n_channels=3, n_classes=1)
+    model = build_u2net(n_channels=3, n_classes=1)
     model.to(device)
-
+ 
     load_pretrained_if_available(model, args.pretrained_checkpoint, device=device)
-
-    criterion = BCEDiceLoss()
+ 
+    # Use edge-aware loss: BCE + Dice + Laplacian boundary loss
+    # This sharpens object boundaries, which is important for background removal.
+    criterion = EdgeAwareLoss(bce_weight=0.5, dice_weight=0.5, edge_weight=0.3)
     optimizer = optim.Adam(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+
+    # For plotting training curves
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_iou": [],
+        "val_dice": [],
+        "val_pixel_acc": [],
+    }
 
     best_val_iou = 0.0
     fixed_images: torch.Tensor | None = None
@@ -251,6 +385,13 @@ def main() -> None:
 
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_metrics = validate_one_epoch(model, val_loader, criterion, device)
+
+        # Store history for plotting
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_iou"].append(val_metrics["iou"])
+        history["val_dice"].append(val_metrics["dice"])
+        history["val_pixel_acc"].append(val_metrics["pixel_acc"])
 
         elapsed = time.time() - start_time
         msg = (
@@ -283,6 +424,19 @@ def main() -> None:
                 pred_masks=pred_masks,
                 out_dir=args.timelapse_dir,
             )
+
+    # After training, generate plotting artifacts
+    plots_dir = os.path.join("outputs", "plots")
+    plot_training_curves(history, out_dir=plots_dir, filename="training_curves.png")
+
+    sample_out_path = os.path.join(plots_dir, "val_samples.png")
+    plot_sample_predictions(
+        model,
+        val_loader,
+        device,
+        out_path=sample_out_path,
+        num_samples=4,
+    )
 
     print("Training complete.")
 

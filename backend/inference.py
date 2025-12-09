@@ -19,10 +19,12 @@ from typing import Optional, Tuple
 import numpy as np
 from PIL import Image
 import torch
+import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
+import matplotlib.pyplot as plt
 
-from .model import build_unet
+from .model import build_unet, build_u2net_lite, build_u2net
 
 
 DEFAULT_IMG_SIZE = 512
@@ -49,7 +51,7 @@ def load_model(config: InferenceConfig) -> torch.nn.Module:
     Returns a model in eval() mode, moved to the requested device.
     """
     device = prepare_device(config.device)
-    model = build_unet(n_channels=3, n_classes=1)
+    model = build_u2net(n_channels=3, n_classes=1)
     model.to(device)
 
     if not os.path.isfile(config.checkpoint_path):
@@ -94,11 +96,16 @@ def predict_mask(
     image: Image.Image,
     img_size: int = DEFAULT_IMG_SIZE,
     threshold: float = 0.5,
+    apply_postprocessing: bool = True,
 ) -> Tuple[Image.Image, Image.Image]:
     """
     Run segmentation on an input image and return:
         - binary mask resized to original resolution (P mode or L)
         - soft mask (grayscale, 0-255) resized to original resolution
+
+    The soft mask is optionally post-processed for visual quality:
+        - small Gaussian blur (denoise / smooth)
+        - morphological closing (fill small holes, smooth edges)
     """
     device = next(model.parameters()).device
 
@@ -110,20 +117,47 @@ def predict_mask(
 
     # Upsample to original resolution
     h_orig, w_orig = orig_hw
-    probs = torch.nn.functional.interpolate(
+    probs = F.interpolate(
         probs.unsqueeze(0).unsqueeze(0),
         size=(h_orig, w_orig),
         mode="bilinear",
         align_corners=True,
     )[0, 0]
 
-    probs_np = probs.cpu().numpy().astype(np.float32)
+    # Optional post-processing in probability space for smoother visual masks
+    if apply_postprocessing:
+        # Work in (1, 1, H, W) format
+        probs_4d = probs.unsqueeze(0).unsqueeze(0)
+
+        # ---- Gaussian blur (3x3 kernel approximating ksize=5 behaviour) ----
+        gaussian_kernel = torch.tensor(
+            [
+                [1.0, 2.0, 1.0],
+                [2.0, 4.0, 2.0],
+                [1.0, 2.0, 1.0],
+            ],
+            device=probs_4d.device,
+            dtype=probs_4d.dtype,
+        ).view(1, 1, 3, 3)
+        gaussian_kernel = gaussian_kernel / gaussian_kernel.sum()
+        probs_4d = F.conv2d(probs_4d, gaussian_kernel, padding=1)
+
+        # ---- Morphological closing: dilation then erosion ----
+        # This fills small holes and smooths narrow gaps around edges.
+        kernel_size = 3
+        padding = kernel_size // 2
+        dilated = F.max_pool2d(probs_4d, kernel_size=kernel_size, stride=1, padding=padding)
+        eroded = -F.max_pool2d(-dilated, kernel_size=kernel_size, stride=1, padding=padding)
+
+        probs = eroded[0, 0].clamp(0.0, 1.0)
+
+    probs_np = probs.detach().cpu().numpy().astype(np.float32)
 
     # Soft mask as grayscale image 0-255
     soft_mask_arr = (probs_np * 255.0).clip(0, 255).astype(np.uint8)
     soft_mask_img = Image.fromarray(soft_mask_arr, mode="L")
 
-    # Binary mask
+    # Binary mask (primarily for debugging / evaluation, not for visual compositing)
     bin_mask_arr = (probs_np >= threshold).astype(np.uint8) * 255
     bin_mask_img = Image.fromarray(bin_mask_arr, mode="L")
 
@@ -186,9 +220,58 @@ def run_inference_on_path(
         composed: RGBA image with transparent or solid background.
     """
     image = Image.open(image_path)
-    bin_mask, soft_mask = predict_mask(model, image, img_size=img_size, threshold=threshold)
-    composed = compose_foreground(image, bin_mask, background_color=background_color)
+    bin_mask, soft_mask = predict_mask(
+        model,
+        image,
+        img_size=img_size,
+        threshold=threshold,
+        apply_postprocessing=True,
+    )
+    # Use the soft mask for compositing to avoid harsh 0/1 edges.
+    composed = compose_foreground(image, soft_mask, background_color=background_color)
     return bin_mask, soft_mask, composed
+
+
+def save_result_grid(
+    image: Image.Image,
+    bin_mask: Image.Image,
+    soft_mask: Image.Image,
+    composed: Image.Image,
+    out_path: str,
+) -> None:
+    """
+    Save a 4-panel visualization:
+
+        [ original image | binary mask | soft mask | foreground ]
+
+    This mirrors the training-time visualization but uses the trained
+    checkpoint directly (no retraining required).
+    """
+    # Ensure image modes are display-friendly
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+    axes[0].imshow(image)
+    axes[0].set_title("Image")
+    axes[0].axis("off")
+
+    axes[1].imshow(bin_mask, cmap="gray")
+    axes[1].set_title("Binary Mask")
+    axes[1].axis("off")
+
+    axes[2].imshow(soft_mask, cmap="gray")
+    axes[2].set_title("Soft Mask (soft)")
+    axes[2].axis("off")
+
+    axes[3].imshow(composed)
+    axes[3].set_title("Foreground")
+    axes[3].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
 
 
 if __name__ == "__main__":
@@ -245,12 +328,18 @@ if __name__ == "__main__":
     bin_path = os.path.join(args.out_dir, f"{stem}_mask_binary.png")
     soft_path = os.path.join(args.out_dir, f"{stem}_mask_soft.png")
     comp_path = os.path.join(args.out_dir, f"{stem}_foreground.png")
+    grid_path = os.path.join(args.out_dir, f"{stem}_grid.png")
 
     bin_mask.save(bin_path)
     soft_mask.save(soft_path)
     composed.save(comp_path)
 
+    # Reload original image for visualization grid
+    orig_image = Image.open(args.image_path)
+    save_result_grid(orig_image, bin_mask, soft_mask, composed, grid_path)
+
     print("Saved:")
     print("  Binary mask :", bin_path)
     print("  Soft mask   :", soft_path)
     print("  Composited  :", comp_path)
+    print("  Grid (img/masks/foreground):", grid_path)

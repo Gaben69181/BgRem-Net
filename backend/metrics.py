@@ -63,6 +63,67 @@ class BCEDiceLoss(nn.Module):
         return self.bce_weight * bce_loss + self.dice_weight * dice_loss
 
 
+class EdgeAwareLoss(nn.Module):
+    """
+    Edge-aware loss for binary segmentation.
+
+    This combines:
+        - BCE with logits
+        - Dice loss
+        - Laplacian-based boundary loss (on sigmoid probabilities)
+
+    The boundary term encourages sharper, better-aligned edges between
+    foreground and background, which is important for background removal.
+
+    loss = bce_dice + edge_weight * edge_loss
+    """
+
+    def __init__(
+        self,
+        bce_weight: float = 0.5,
+        dice_weight: float = 0.5,
+        edge_weight: float = 0.3,
+    ) -> None:
+        super().__init__()
+        self.bce_dice = BCEDiceLoss(bce_weight=bce_weight, dice_weight=dice_weight)
+        self.edge_weight = edge_weight
+
+        # 3x3 Laplacian kernel for edge detection
+        kernel = torch.tensor(
+            [[0.0, 1.0, 0.0],
+             [1.0, -4.0, 1.0],
+             [0.0, 1.0, 0.0]],
+            dtype=torch.float32,
+        )
+        # Shape: (out_channels, in_channels, kH, kW) = (1, 1, 3, 3)
+        self.register_buffer("laplacian_kernel", kernel.view(1, 1, 3, 3))
+
+    def _compute_edges(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Laplacian edges from a (B, 1, H, W) tensor.
+
+        We clamp the result to keep edge magnitudes bounded, which
+        stabilizes training when combined with BCE + Dice.
+        """
+        # Ensure kernel lives on the same device and dtype as input tensor `x`
+        kernel = self.laplacian_kernel.to(x.device, dtype=x.dtype)
+        edges = F.conv2d(x, kernel, padding=1)
+        return edges
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Base BCE + Dice loss on logits
+        base_loss = self.bce_dice(logits, targets)
+
+        # Boundary loss on Laplacian of probabilities
+        probs = torch.sigmoid(logits)
+        pred_edges = self._compute_edges(probs)
+        gt_edges = self._compute_edges(targets)
+
+        edge_loss = F.mse_loss(pred_edges, gt_edges)
+
+        return base_loss + self.edge_weight * edge_loss
+
+
 @torch.no_grad()
 def compute_confusion(
     logits: torch.Tensor,
@@ -155,6 +216,125 @@ def evaluate_batch(
     return {"iou": iou, "dice": dice, "pixel_acc": acc}
 
 
+class AverageMeter:
+    """
+    Tracks the running average of a scalar metric (e.g. loss, IoU) over batches.
+
+    Example:
+        meter = AverageMeter()
+        for loss in batch_losses:
+            meter.update(loss, n=batch_size)
+        print(meter.avg)
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.value: float = 0.0
+        self.sum: float = 0.0
+        self.count: int = 0
+        self.avg: float = 0.0
+
+    def update(self, value: float, n: int = 1) -> None:
+        self.value = float(value)
+        self.sum += float(value) * n
+        self.count += n
+        if self.count > 0:
+            self.avg = self.sum / self.count
+        else:
+            self.avg = 0.0
+
+
+class EpochMetricTracker:
+    """
+    Helper to monitor training/validation metrics within a single epoch.
+
+    This is intended to be used inside the training loop to accumulate
+    running averages and optionally print progress every few batches.
+
+    Typical usage in a training loop:
+
+        tracker = EpochMetricTracker()
+        for batch_idx, (images, masks) in enumerate(loader, start=1):
+            logits = model(images)
+            loss = criterion(logits, masks)
+
+            tracker.update(loss=loss, logits=logits, targets=masks, batch_size=images.size(0))
+
+            if batch_idx % log_interval == 0:
+                stats = tracker.as_dict()
+                print(
+                    f"Batch {batch_idx}/{len(loader)} "
+                    f"- loss: {stats['loss']:.4f} "
+                    f"- IoU: {stats['iou']:.4f} "
+                    f"- Dice: {stats['dice']:.4f} "
+                    f"- PixelAcc: {stats['pixel_acc']:.4f}"
+                )
+
+        epoch_stats = tracker.as_dict()
+
+    Note:
+        - `update` expects raw logits and target masks in (B, 1, H, W).
+        - Metrics are computed on detached tensors to avoid interfering with autograd.
+    """
+
+    def __init__(self, threshold: float = 0.5) -> None:
+        self.threshold = threshold
+        self.reset()
+
+    def reset(self) -> None:
+        self.loss_meter = AverageMeter()
+        self.iou_meter = AverageMeter()
+        self.dice_meter = AverageMeter()
+        self.pixel_acc_meter = AverageMeter()
+
+    def update(
+        self,
+        loss: torch.Tensor | float,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> None:
+        """
+        Update running metrics with a new batch.
+
+        Args:
+            loss: Scalar tensor or float for this batch.
+            logits: Raw model outputs (B, 1, H, W).
+            targets: Ground-truth masks (B, 1, H, W).
+            batch_size: Optional batch size; if None, inferred from logits.
+        """
+        if batch_size is None:
+            batch_size = int(logits.size(0))
+
+        # Loss
+        loss_value = float(loss.detach().cpu().item() if isinstance(loss, torch.Tensor) else loss)
+        self.loss_meter.update(loss_value, n=batch_size)
+
+        # Detach tensors before computing metrics
+        batch_metrics = evaluate_batch(
+            logits.detach(),
+            targets.detach(),
+            threshold=self.threshold,
+        )
+        self.iou_meter.update(batch_metrics["iou"], n=batch_size)
+        self.dice_meter.update(batch_metrics["dice"], n=batch_size)
+        self.pixel_acc_meter.update(batch_metrics["pixel_acc"], n=batch_size)
+
+    def as_dict(self) -> Dict[str, float]:
+        """
+        Return current running averages as a plain dict:
+            {"loss": ..., "iou": ..., "dice": ..., "pixel_acc": ...}
+        """
+        return {
+            "loss": self.loss_meter.avg,
+            "iou": self.iou_meter.avg,
+            "dice": self.dice_meter.avg,
+            "pixel_acc": self.pixel_acc_meter.avg,
+        }
+
+
 if __name__ == "__main__":
     # Smoke test
     logits = torch.randn(2, 1, 16, 16)
@@ -166,3 +346,11 @@ if __name__ == "__main__":
     metrics = evaluate_batch(logits, targets)
     print("Loss:", float(loss))
     print("Metrics:", metrics)
+
+    # Test training-progress helpers
+    tracker = EpochMetricTracker()
+    for _ in range(5):
+        # Simulate repeated batches with the same logits/targets
+        loss = loss_fn(logits, targets)
+        tracker.update(loss=loss, logits=logits, targets=targets, batch_size=logits.size(0))
+    print("Epoch stats:", tracker.as_dict())

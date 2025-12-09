@@ -125,8 +125,8 @@ def build_timelapse_for_sample(
 
 
 def build_all_timelapses(
-    frames_root: str = "outputs/timelapse",
-    out_dir: str = "outputs/videos",
+    frames_root: str = "../outputs/timelapse",
+    out_dir: str = "../outputs/videos",
     fmt: str = "gif",
     fps: int = 5,
 ) -> None:
@@ -158,7 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out-dir",
         type=str,
-        default="outputs/videos",
+        default="../outputs/videos",
         help="Target directory to store generated timelapse videos.",
     )
     parser.add_argument(
