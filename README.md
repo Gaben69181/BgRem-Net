@@ -1,7 +1,7 @@
-# Background Removal with U-Net Segmentation
+# Background Removal with U²-Net Segmentation
 
 Final project for Deep Learning course – image background removal via pixel-wise
-segmentation using a U-Net convolutional neural network implemented in PyTorch.
+segmentation using a U²-Net convolutional neural network implemented in PyTorch.
 
 The system takes an RGB image (any resolution up to ~3000×3000), resizes it to
 512×512 internally, predicts a foreground mask, and returns:
@@ -59,20 +59,17 @@ project_root/
    # or
    .venv\Scripts\activate    # Windows
    ```
-
 2. Install dependencies:
 
    ```bash
    pip install -r requirements.txt
    ```
-
 3. (Optional but recommended) Verify that PyTorch detects your GPU:
 
    ```python
    import torch
    print(torch.cuda.is_available())
    ```
-
 4. Download and prepare the dataset (P3M-10k from Kaggle):
 
    ```bash
@@ -131,17 +128,25 @@ segmentation dataset. Examples:
 
 Convert / rename files as necessary so they follow the folder structure above.
 
-## 4. Model architecture (U-Net)
+## 4. Model architecture (U²-Net)
 
-The network is a standard **U-Net** for binary segmentation, implemented in
-`backend/model.py`. Key properties:
+The main network is a **U²-Net** for binary segmentation, implemented in
+`backend/model.py` (see the [`U2NET`](backend/model.py:354) class and helper
+[`build_u2net()`](backend/model.py:460)). Key properties:
 
 - Input: 3-channel RGB image, resized to 512×512.
 - Output: 1-channel logit map (same spatial size) for foreground probability.
-- Encoder: 4 levels of downsampling with `DoubleConv` blocks (Conv–BN–ReLU ×2).
-- Decoder: 4 levels of upsampling with skip connections from encoder.
-- Final 1×1 convolution maps decoder features to a 1-channel logit mask.
-- Upsampling uses bilinear interpolation for stability.
+- Encoder–decoder backbone built from nested **RSU blocks** (Residual U-blocks),
+  which capture multi‑scale context more efficiently than plain U-Net.
+- Deep encoder with multiple pooling stages, followed by a bridge with dilated
+  convolutions for large receptive field.
+- Decoder with skip connections from encoder stages, upsampled via bilinear
+  interpolation.
+- Final 1×1 convolution maps decoder features to a 1‑channel logit mask.
+
+A classic U-Net baseline is also implemented via
+[`build_unet()`](backend/model.py:161) for comparison, but all default training
+and inference entry points in this project use **U²-Net**.
 
 During training we apply `torch.sigmoid` to the logits inside the Dice loss; at
 inference time, we threshold the mask (default 0.5) to get a binary foreground.
@@ -284,7 +289,6 @@ High-level sequence:
    ```bash
    pip install -r requirements.txt
    ```
-
 2. **Download and prepare dataset (P3M-10k from Kaggle):**
 
    ```bash
@@ -293,19 +297,16 @@ High-level sequence:
 
    This automatically downloads the **P3M-10k** dataset and
    organizes it into `data_p3m/train/` and `data_p3m/val/` folders.
-
 3. **Train (with timelapse frames):**
 
    ```bash
    python backend/train.py --data-root data_p3m --epochs 20 --timelapse
    ```
-
 4. **Generate timelapse videos:**
 
    ```bash
    python backend/timelapse.py --frames-root outputs/timelapse --out-dir outputs/videos --format gif
    ```
-
 5. **Run inference on a single image (optional):**
 
    ```bash
@@ -313,7 +314,6 @@ High-level sequence:
      --checkpoint outputs/checkpoints/best_model.pth \
      --out-dir outputs/images
    ```
-
 6. **Launch the Streamlit app:**
 
    ```bash
@@ -328,28 +328,25 @@ When presenting this project, you can highlight:
 
    - Background removal as a pixel-wise binary segmentation problem.
    - Importance in virtual backgrounds, photo editing, AR, etc.
+2. **Model choice (U²-Net)**
 
-2. **Model choice (U-Net)**
-
-   - Encoder–decoder structure with skip connections.
-   - Trade-off between model capacity and real-time inference speed.
-
+   - U²-Net encoder–decoder with nested RSU blocks and skip connections.
+   - Better multi‑scale context capture compared to plain U-Net, while still
+     keeping inference feasible on a single GPU.
 3. **Data processing**
 
    - Handling of arbitrary input resolutions via resize to 512×512.
    - Data augmentation (flips, slight rotations) to improve generalization.
-
 4. **Loss and metrics**
 
    - Why combine BCE + Dice (stability + overlap quality).
    - Use of IoU, Dice, and pixel accuracy to evaluate segmentation.
-
 5. **Results & visualization**
 
    - Qualitative examples of input / mask / background-removed outputs.
    - Timelapse videos illustrating convergence over training epochs.
-
 6. **Limitations & future work**
+
    - Failure cases (e.g., very complex backgrounds, small objects).
    - Possible extensions: MODNet-style trimap, refinement network,
      more advanced backbones (e.g., ResNet, MobileNet), or knowledge
@@ -357,12 +354,12 @@ When presenting this project, you can highlight:
 
 ## 11. Reproducibility checklist
 
-- [x] Fixed project structure with separate frontend and backend.
-- [x] Deterministic input size (512×512) and normalization.
-- [x] Clearly defined training/evaluation scripts (`backend/train.py`).
-- [x] Defined metrics (IoU, Dice, Pixel Accuracy).
-- [x] Local deployment with Streamlit UI (`frontend/app.py`).
-- [x] Timelapse visualization pipeline (`backend/timelapse.py`).
+- [X] Fixed project structure with separate frontend and backend.
+- [X] Deterministic input size (512×512) and normalization.
+- [X] Clearly defined training/evaluation scripts (`backend/train.py`).
+- [X] Defined metrics (IoU, Dice, Pixel Accuracy).
+- [X] Local deployment with Streamlit UI (`frontend/app.py`).
+- [X] Timelapse visualization pipeline (`backend/timelapse.py`).
 
 This completes a full deep learning pipeline for **image background removal**
 from dataset and training to evaluation, visualization, and local deployment.
